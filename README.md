@@ -1,4 +1,4 @@
-# Spectrum-as-Sequence (Pilot v1)
+# Spectrum-as-Sequence (Pilot v1 + v2)
 
 Reprogramming a frozen CLIP (ViT-B/16) for hyperspectral imagery by treating
 the band axis as a **sequence**: time-series foundation-model kernels
@@ -14,7 +14,29 @@ This repo contains the **pilot v1** experiment of the research route:
 - zero-shot transfer to Indian Pines (disjoint class sets, cross-sensor)
 - RGB-direct CLIP baselines (spectral -> RGB interpolation, SPECIAL-style)
 
-## Key findings (pilot v1)
+## Key findings
+
+### Pilot v2: wavelength-space tokenization + spectral token injection (this repo's final state)
+
+| Setting | PaviaU mIoU | IP mIoU |
+|---|---|---|
+| 5-shot injected adapter (45/80 labels) | **50.8%** | **50.1%** |
+| RGB-direct CLIP zero-shot | 3.4% | 2.6% |
+
+- `wavelength_patcher.py`: patches defined in physical wavelength space
+  (50 nm bins, absolute-wavelength positional encoding) -> the spectral token
+  sequence is sensor-aligned by construction.
+- `injected_vit.py`: spectral tokens cross-attend into the frozen CLIP ViT at
+  layers 3/6/9 (zero-init gamma); 7.46M trainable params; 26 s training,
+  2.7 GB peak on a single 3090 Ti.
+- Open-vocabulary base/novel analysis (`train_v2.py --base_ids --balanced`):
+  5-shot training collapses novel classes (0.0 mIoU); three prior-preservation
+  mitigations (early stop, logit fusion, KL self-distillation) only trade base
+  vs novel; at 50 shots/class novel classes recover (7.7 mIoU = 2.3x the RGB
+  baseline) while base reaches 59.2 (8.2x baseline). The 5-shot open-vocab
+  failure mode is characterised, not hidden.
+
+### Pilot v1 (historical, pooled-vector interface)
 
 | Setting | PaviaU mIoU | OA |
 |---|---|---|
@@ -35,6 +57,9 @@ This repo contains the **pilot v1** experiment of the research route:
 
 ```
 spectrum_seq/         package
+  wavelength_patcher.py  M4: wavelength-space tokenization (v2)
+  injected_vit.py        M2: spectral token injection into frozen CLIP ViT (v2)
+  train_v2.py            v2 training / base-novel / balancing / calibration
   data.py             PaviaU / Indian Pines loaders + normalisation
   model.py            SpectralPatcher (M1) + InvertedBandAttention (M2) + adapter
   clip_utils.py       frozen CLIP loading (local TorchScript ckpt), text prompts,

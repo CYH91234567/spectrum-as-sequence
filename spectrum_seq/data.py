@@ -33,14 +33,15 @@ class HSIScene:
 
 
 PAVIAU_BANDS_UM = np.linspace(0.43, 0.86, 103)
-# Indian Pines corrected: 200 bands after removing water-absorption windows.
-# Nominal coverage 0.4-2.45 um; we use the published AVIRIS NW-sector band map
-# approximation (10 nm steps for the VNIR block, 10 nm for SWIR blocks).
-IP_BANDS_UM = np.concatenate([
+# AVIRIS (Indian Pines / Salinas): 224 nominal bands, 20 water-absorption
+# bands removed -> 200 (IP) / 204 (Salinas) bands, ~10 nm VNIR spacing.
+AVIRIS_BANDS_UM = np.concatenate([
     np.arange(0.4005, 1.33, 0.01),          # 94 bands 0.40-1.32
     np.arange(1.43, 1.81, 0.01),            # 39 bands 1.43-1.80
     np.arange(1.96, 2.39, 0.01),            # 44+ bands up to 2.36
-])[:200]
+])
+IP_BANDS_UM = AVIRIS_BANDS_UM[:200]
+SALINAS_BANDS_UM = AVIRIS_BANDS_UM[:204]
 
 
 PAVIAU_CLASSES = [
@@ -53,11 +54,20 @@ IP_CLASSES = [
     "Soybean notill", "Soybean mintill", "Soybean clean", "Wheat",
     "Woods", "Buildings grass trees drives", "Stone steel towers",
 ]
+SALINAS_CLASSES = [
+    "Broccoli green weeds 1", "Broccoli green weeds 2", "Fallow",
+    "Fallow rough plow", "Fallow smooth", "Stubble", "Celery",
+    "Grapes untrained", "Soil vineyard develop",
+    "Corn senesced green weeds", "Lettuce romaine 4wk",
+    "Lettuce romaine 5wk", "Lettuce romaine 6wk", "Lettuce romaine 7wk",
+    "Vinyard untrained", "Vinyard vertical trellis",
+]
 
 _RGB_BANDS = {
     # scene key -> (blue, green, red) band indices approximating 470/550/640 nm
     "paviau": (9, 29, 52),
     "indianpines": (10, 15, 25),
+    "salinas": (10, 15, 25),
 }
 
 
@@ -83,6 +93,11 @@ def load_scene(name: str, data_dir: str) -> HSIScene:
         gt = sio.loadmat(os.path.join(data_dir, "Indian_pines_gt.mat"))["indian_pines_gt"]
         scene = HSIScene(_norm_cube(cube), gt.astype(np.int64), IP_CLASSES, IP_BANDS_UM)
         scene.key = "indianpines"
+    elif name in ("salinas", "salinas_corrected"):
+        cube = sio.loadmat(os.path.join(data_dir, "Salinas_corrected.mat"))["salinas_corrected"]
+        gt = sio.loadmat(os.path.join(data_dir, "Salinas_gt.mat"))["salinas_gt"]
+        scene = HSIScene(_norm_cube(cube), gt.astype(np.int64), SALINAS_CLASSES, SALINAS_BANDS_UM)
+        scene.key = "salinas"
     else:
         raise ValueError(f"unknown scene {name}")
     return scene

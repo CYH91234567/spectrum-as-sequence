@@ -19,11 +19,16 @@ from .zero_shot_ip import labelled_pixels
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--scene", default="paviau", choices=["paviau", "indianpines"])
+    ap.add_argument("--scene", default="paviau", choices=["paviau", "indianpines", "salinas"])
     ap.add_argument("--data", required=True)
     ap.add_argument("--clip", required=True)
     ap.add_argument("--out", default="../results")
     ap.add_argument("--win", type=int, default=32)
+    ap.add_argument("--base_ids", default=None)
+    ap.add_argument("--calibrate", action="store_true")
+    ap.add_argument("--balanced", action="store_true")
+    ap.add_argument("--balanced_iters", type=int, default=5)
+    ap.add_argument("--balanced_tau", type=float, default=1.0)
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     device = "cuda"
@@ -34,11 +39,24 @@ def main():
     rgb = make_rgb_cube(scene)
     ys, xs = labelled_pixels(scene.gt)
     emb = encode_rgb_patches(clip_model, rgb, ys, xs, win=args.win, device=device)
-    pred_pix = (100.0 * emb @ T.T).argmax(-1)
+    logits = 100.0 * emb @ T.T
+    if args.calibrate:
+        mu = logits.mean(0, keepdim=True)
+        sd = logits.std(0, keepdim=True) + 1e-6
+        logits = (logits - mu) / sd
+    if args.balanced:
+        for _ in range(args.balanced_iters):
+            r = logits.softmax(-1).mean(0).clamp_min(1e-8)
+            logits = logits - args.balanced_tau * r.log()
+    pred_pix = logits.argmax(-1)
     pred = np.zeros(scene.gt.shape, dtype=np.int64)
     pred[ys, xs] = pred_pix.cpu().numpy()
     res = metrics(pred, scene.gt, scene.num_classes)
-    res.update({"scene": args.scene, "win": args.win})
+    if args.base_ids:
+        from .train_v2 import split_metrics
+        base = [int(i) for i in args.base_ids.split(",")]
+        res = split_metrics(res, base, scene.num_classes)
+    res.update({"scene": args.scene, "win": args.win, "calibrate": args.calibrate})
     print(json.dumps({k: v for k, v in res.items() if not isinstance(v, list)}, indent=2))
     with open(os.path.join(args.out, f"rgb_baseline_{args.scene}.json"), "w") as f:
         json.dump(res, f, indent=2)
