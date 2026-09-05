@@ -42,6 +42,31 @@ def rgb_crop_tensor(rgb_cube, ys, xs, device, half=IMG_WIN // 2):
     return (batch - mean) / std
 
 
+class CropBank:
+    """All IMG_WIN x IMG_WIN edge-padded crops of a scene on GPU via one unfold
+    (~263MB fp16 for 42k-pixel scenes). Batch gather + bicubic resize replace
+    the per-crop python loop that made full-supervision epochs ~10x too slow."""
+
+    def __init__(self, rgb_cube, device, half=IMG_WIN // 2):
+        import torch as _t
+        H, W, _ = rgb_cube.shape
+        padded = np.pad(rgb_cube, ((half, half), (half, half), (0, 0)), mode="edge")
+        cube = _t.from_numpy(padded).permute(2, 0, 1)[None].to(device).half()  # (1,3,H+2p,W+2p)
+        self.win = IMG_WIN
+        # windows: (1, 3, H, W, win, win) view via unfold
+        w = cube.unfold(2, IMG_WIN, 1).unfold(3, IMG_WIN, 1)[0]  # (3,H+2p-win+1,...)
+        w = w[:, :H, :W]                                          # keep window starts 0..H-1
+        self.bank = w.permute(1, 2, 0, 3, 4).reshape(H * W, 3, IMG_WIN, IMG_WIN)
+        self.mean = _t.tensor([0.48145466, 0.4578275, 0.40821073], device=device).view(1, 3, 1, 1)
+        self.std = _t.tensor([0.26862954, 0.26130258, 0.27577711], device=device).view(1, 3, 1, 1)
+
+    def fetch(self, ys, xs, W):
+        ids = torch.as_tensor(ys, device=self.bank.device) * W + torch.as_tensor(xs, device=self.bank.device)
+        batch = self.bank[ids].float()
+        batch = F.interpolate(batch, size=224, mode="bicubic", align_corners=False).clamp(0, 1)
+        return (batch - self.mean) / self.std
+
+
 @torch.no_grad()
 def predict_full_map(model, scene, T, device="cuda", batch=384, fuse="injection", s_res=None,
                      calibrate=False, labelled_only=True, balanced=False,
@@ -92,6 +117,22 @@ def predict_full_map(model, scene, T, device="cuda", batch=384, fuse="injection"
     return preds
 
 
+def metrics_masked(pred, gt, num_classes, mask):
+    """metrics restricted to a boolean pixel mask (held-out split)."""
+    m = (gt > 0) & mask
+    p, g = pred[m] + 1, gt[m]
+    oa = float((p == g).mean())
+    ious, recalls = [], []
+    for c in range(1, num_classes + 1):
+        tp = ((p == c) & (g == c)).sum()
+        fp = ((p == c) & (g != c)).sum()
+        fn = ((p != c) & (g == c)).sum()
+        ious.append(float(tp / max(tp + fp + fn, 1)))
+        recalls.append(float(tp / max(tp + fn, 1)))
+    return {"mIoU": float(np.mean(ious)), "OA": oa, "mRecall": float(np.mean(recalls)),
+            "IoU_per_class": ious, "recall_per_class": recalls}
+
+
 def split_metrics(res, base_ids, num_classes):
     """Add base/novel mean-IoU and harmonic-mean hMIoU to a metrics dict."""
     novel = [c for c in range(num_classes) if c not in base_ids]
@@ -137,6 +178,14 @@ def main():
                          "(prior-preserving self-distillation)")
     ap.add_argument("--n_unlab", type=int, default=1024,
                     help="unlabeled pixels sampled for the KL term")
+    ap.add_argument("--tokenize", default="wl50",
+                    help="M4 ablation: wl25/wl50/wl100 wavelength bins, "
+                         "bandindex (P25 S5), bandeq9 (9 equal chunks)")
+    ap.add_argument("--trans_w", type=float, default=0.0,
+                    help="TSC: weight of spectral-neighbourhood consistency + "
+                         "marginal balancing on unlabeled pixels")
+    ap.add_argument("--n_trans", type=int, default=512)
+    ap.add_argument("--knn", type=int, default=8)
     ap.add_argument("--fuse", choices=["injection", "prior"], default="injection",
                     help="injection: logits from injected embedding only; "
                          "prior: logits = frozen zero-shot + s * injected "
@@ -156,9 +205,24 @@ def main():
     clip_model, tokenizer, _ = load_clip(args.clip, device)
     T = class_text_embeddings(clip_model, tokenizer, scene.class_names, device)
 
+    # ckpt config first: band-index tokenizers must reuse the TRAIN scene's
+    # chunk definition at zero-shot time (that misalignment IS the ablation)
+    eval_cfg = None
+    if args.eval_only_ckpt:
+        eval_cfg = torch.load(args.eval_only_ckpt, map_location="cpu", weights_only=False).get("config", {})
+    token_src = args.eval_scene
+    if args.tokenize != "wl50" and eval_cfg is not None:
+        token_src = eval_cfg.get("train_scene") or eval_cfg.get("eval_scene") or args.eval_scene
+    spec_enc = None
+    if args.tokenize != "wl50":
+        from .wavelength_patcher import build_spec_encoder
+        spec_enc, n_tok = build_spec_encoder(args.tokenize, load_scene(token_src, args.data),
+                                             d_model=args.d_spec, layers=args.spec_layers)
+        print(f"tokenize={args.tokenize} (source scene {token_src}): {n_tok} tokens")
     model = InjectedCLIP(clip_model, bins, centers, MAX_BANDS,
                          d_spec=args.d_spec, spec_layers=args.spec_layers,
-                         inject_layers=tuple(int(i) for i in args.inject_layers.split(","))).to(device)
+                         inject_layers=tuple(int(i) for i in args.inject_layers.split(",")),
+                         spec_enc=spec_enc).to(device)
     n_params = sum(p.numel() for p in model.trainable_parameters())
     print(f"trainable params: {n_params/1e6:.2f}M")
 
@@ -166,7 +230,7 @@ def main():
     ckpt_path = os.path.join(args.out, f"adapter_{tag}.pt")
     s_res = torch.zeros(1, device=device) if args.fuse == "prior" else None
     if args.eval_only_ckpt:
-        ckpt = torch.load(args.eval_only_ckpt, map_location=device, weights_only=False)
+        ckpt = torch.load(args.eval_only_ckpt, map_location=device, weights_only=False) if eval_cfg is None             else {"state": torch.load(args.eval_only_ckpt, map_location=device, weights_only=False)["state"]}
         model.load_state_dict({k: v for k, v in ckpt["state"].items()}, strict=False)
         tag = "zs_" + os.path.basename(args.eval_only_ckpt).replace("adapter_", "").replace(".pt", "") \
             + f"_to_{args.eval_scene}"
@@ -175,7 +239,8 @@ def main():
         train_scene = load_scene(train_scene_name, args.data)
         fuse_tag = "prior" if args.fuse == "prior" else "inj"
         base_tag = "_base" + args.base_ids.replace(",", "-") if args.base_ids else ""
-        tag = f"v2_{train_scene_name}_s{args.shots}_{fuse_tag}{base_tag}_seed{args.seed}"
+        tok_tag = "" if args.tokenize == "wl50" else f"_{args.tokenize}"
+        tag = f"v2_{train_scene_name}_s{args.shots}_{fuse_tag}{tok_tag}{base_tag}_seed{args.seed}"
         ckpt_path = os.path.join(args.out, f"adapter_{tag}.pt")
         base_ids = [int(i) for i in args.base_ids.split(",")] if args.base_ids else None
         rgb = make_rgb_cube(train_scene)
@@ -194,6 +259,21 @@ def main():
         else:
             pixels, labels = sample_shots(train_scene.gt, args.shots, seed=args.seed)
         big_mode = len(pixels) > 2048       # full supervision: batched epochs
+        test_mask = None
+        if big_mode:
+            # 50/50 train/test split: a 7.46M adapter memorises the train set,
+            # so the ceiling must be measured on held-out pixels
+            rng_s = np.random.default_rng(123)
+            perm = rng_s.permutation(len(pixels))
+            half = len(perm) // 2
+            tr, te = perm[:half], perm[half:]
+            pixels_tr, labels_tr = pixels[tr], labels[tr]
+            test_mask = np.zeros(train_scene.gt.shape, dtype=bool)
+            test_mask[pixels[te, 0], pixels[te, 1]] = True
+            train_mask = np.zeros(train_scene.gt.shape, dtype=bool)
+            train_mask[pixels_tr[:, 0], pixels_tr[:, 1]] = True
+            print(f"split: train {len(tr)} px, test {len(te)} px", flush=True)
+            pixels, labels = pixels_tr, labels_tr
         spec_b = torch.from_numpy(train_scene.cube[pixels[:, 0], pixels[:, 1]]).to(device)
         y = torch.from_numpy(labels).to(device)
         rgb_b = None if big_mode else rgb_crop_tensor(rgb, pixels[:, 0], pixels[:, 1], device)
@@ -213,6 +293,22 @@ def main():
                 logits0u = (100.0 * F.normalize(z0u.float(), dim=-1) @ T.T).detach()
                 del z0u
                 torch.cuda.empty_cache()
+        # TSC: unlabeled pixels + spectral kNN graph (precomputed once)
+        trans_data = None
+        if args.trans_w > 0 and not big_mode:
+            rng_t = np.random.default_rng(args.seed + 2)
+            Hs, Ws, _ = train_scene.shape
+            all_pix = [(yy, xx) for yy in range(Hs) for xx in range(Ws)]
+            sel_t = rng_t.choice(len(all_pix), size=min(args.n_trans, len(all_pix)), replace=False)
+            tpix = np.array([all_pix[i] for i in sel_t])
+            tspec = train_scene.cube[tpix[:, 0], tpix[:, 1]]
+            # cosine kNN on raw normalized spectra
+            sim = tspec @ tspec.T
+            np.fill_diagonal(sim, -9.0)
+            knn_idx = np.argsort(-sim, axis=1)[:, :args.knn]        # (N, k)
+            t_rgb = rgb_crop_tensor(rgb, tpix[:, 0], tpix[:, 1], device).half()
+            t_spec = torch.from_numpy(tspec).to(device).half()
+            trans_data = (t_rgb, t_spec, torch.from_numpy(knn_idx).to(device))
         opt = torch.optim.AdamW(model.trainable_parameters(), lr=args.lr, weight_decay=0.01)
         s_res = None
         if args.fuse == "prior":
@@ -222,16 +318,20 @@ def main():
         torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         bs_train = 128
+        crop_bank = None
         scaler = torch.cuda.amp.GradScaler() if big_mode else None
         for ep in range(args.epochs):
             model.train()
             if big_mode:
-                # crops built per batch: precomputing 42k crops would OOM
+                if crop_bank is None:
+                    crop_bank = CropBank(rgb, device)
+                    print("crop bank ready", flush=True)
                 perm = np.random.permutation(len(pixels))
                 ep_loss, nb = 0.0, 0
+                Hs, Ws, _ = train_scene.shape
                 for bi in range(0, len(perm), bs_train):
                     idx = perm[bi:bi + bs_train]
-                    rgb_bi = rgb_crop_tensor(rgb, pixels[idx, 0], pixels[idx, 1], device)
+                    rgb_bi = crop_bank.fetch(pixels[idx, 0], pixels[idx, 1], Ws)
                     spec_bi = spec_b[torch.from_numpy(idx).to(device)]
                     with torch.autocast(device_type="cuda"):
                         z = model.encode_image(rgb_bi, spec_bi)
@@ -275,6 +375,28 @@ def main():
                                     reduction="batchmean")
                     (args.prior_kl * kl_c / n_chunks).backward()
                     kl_val += float(kl_c)
+            if trans_data is not None:
+                # TSC: spectral-neighbourhood consistency + marginal balancing.
+                # Neighbour graph lives on the spectral manifold (not RGB/space).
+                t_rgb, t_spec, knn_idx = trans_data
+                t_logits = []
+                for cj in range(0, t_spec.shape[0], 128):
+                    with torch.autocast(device_type="cuda"):
+                        zt = model.encode_image(t_rgb[cj:cj + 128].float(), t_spec[cj:cj + 128].float())
+                    t_logits.append(F.normalize(zt.float(), dim=-1) @ T.T)
+                t_logits = torch.cat(t_logits, 0)                      # (N, C)
+                p_all = F.softmax(t_logits, -1)
+                # KL(mean(p) || uniform) = log C + sum m_c log m_c  (>= 0)
+                m = p_all.mean(0)
+                l_marg = (m * m.clamp_min(1e-8).log()).sum() +                     torch.log(torch.tensor(float(p_all.shape[1]), device=t_logits.device))
+                # JS(p_i, p_j) over spectral kNN pairs
+                pj = p_all[knn_idx]                                    # (N, k, C)
+                log_m = ((p_all.unsqueeze(1) + pj) / 2).clamp_min(1e-8).log()
+                l_cons = 0.5 * F.kl_div(log_m, p_all.unsqueeze(1).expand_as(pj),
+                                        reduction="batchmean") +                     0.5 * F.kl_div(log_m, pj, reduction="batchmean")
+                l_tsc = l_marg + l_cons
+                (args.trans_w * l_tsc).backward()
+                loss = loss.detach() + float(l_tsc) * args.trans_w
             opt.step()
             sched.step()
             if args.prior_kl > 0:
@@ -294,6 +416,15 @@ def main():
                             balanced_iters=args.balanced_iters, balanced_tau=args.balanced_tau)
     eval_time = time.time() - t1
     res = metrics(pred, scene.gt, scene.num_classes)
+    if test_mask is not None:
+        res_test = metrics_masked(pred, scene.gt, scene.num_classes, test_mask)
+        res_train = metrics_masked(pred, scene.gt, scene.num_classes, train_mask)
+        res["heldout_mIoU"] = res_test["mIoU"]
+        res["heldout_OA"] = res_test["OA"]
+        res["heldout_mRecall"] = res_test["mRecall"]
+        res["train_mIoU"] = res_train["mIoU"]
+        res["heldout_IoU_per_class"] = res_test["IoU_per_class"]
+        print(f"held-out ceiling: mIoU {res['heldout_mIoU']:.4f} OA {res['heldout_OA']:.4f}", flush=True)
     if args.base_ids:
         res = split_metrics(res, [int(i) for i in args.base_ids.split(",")], scene.num_classes)
         res["s_residual"] = float(s_res.exp()) if s_res is not None else None

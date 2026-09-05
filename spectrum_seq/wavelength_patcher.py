@@ -85,3 +85,83 @@ class SpecEncoder(nn.Module):
 
     def forward(self, x):
         return self.out(self.encoder(self.patcher(x)))  # (N, T, 768)
+
+
+class BandIndexPatcher(nn.Module):
+    """Ablation T4/T5: tokenize by band index (equal-band-count patches), i.e.
+    v1-style patching inside the injected architecture. Physical axis plays no
+    role; positional encoding uses relative token position. When n_tokens is
+    given, bands are split into that many contiguous equal chunks (T5)."""
+
+    def __init__(self, num_bands: int, patch_len: int = 25, stride: int = 5,
+                 n_tokens: int = None, d_model: int = 128):
+        super().__init__()
+        self.d = d_model
+        self.max_bands = num_bands
+        if n_tokens is None:                       # T4: overlapping patches
+            self.P, self.S = patch_len, stride
+            self.T = (num_bands - patch_len) // stride + 1
+            self.chunks = [list(range(i * stride, i * stride + patch_len))
+                           for i in range(self.T)]
+        else:                                      # T5: n_tokens equal chunks
+            self.P = self.S = None
+            self.T = n_tokens
+            k = num_bands // n_tokens
+            self.chunks = [list(range(i * k, (i + 1) * k)) for i in range(n_tokens)]
+        self.max_chunk = max(len(c) for c in self.chunks)
+        self.embed = nn.Linear(2 * self.max_chunk, d_model)
+        self.ln = nn.LayerNorm(d_model)
+        self.register_buffer("pe", self._rel_pe(self.T, d_model), persistent=False)
+
+    @staticmethod
+    def _rel_pe(T, d):
+        half = d // 2
+        pos = torch.arange(T, dtype=torch.float32) / max(T - 1, 1)
+        freq = torch.exp(torch.arange(half, dtype=torch.float32) * (-math.log(10000.0) / max(half - 1, 1)))
+        ang = pos[:, None] * freq[None, :]
+        return torch.cat([torch.sin(ang), torch.cos(ang)], dim=-1)
+
+    def forward(self, x):
+        N, B = x.shape
+        vals = x.new_zeros(N, self.T, self.max_chunk)
+        mask = x.new_zeros(N, self.T, self.max_chunk)
+        for t, idx in enumerate(self.chunks):
+            k = len(idx)
+            vals[:, t, :k] = x[:, idx]
+            mask[:, t, :k] = 1.0
+        tok = self.ln(self.embed(torch.cat([vals, mask], dim=-1)))
+        return tok + self.pe[None, :, :]
+
+
+def build_spec_encoder(tokenize: str, scene, d_model: int = 128, layers: int = 2):
+    """Factory for the M4 tokenize ablation: returns encoder producing
+    (N, T, 768) tokens from (N, B) spectra."""
+    from .wavelength_patcher import SpecEncoder  # local import guard
+
+    if tokenize.startswith("wl"):
+        width = float(tokenize[2:]) / 1000.0     # 'wl50' -> 0.05um
+        bins, centers = build_bin_plan(scene.wavelengths_um, 0.43, 0.86, width)
+        max_bands = max(len(b) for b in bins) + 2
+        return SpecEncoder(bins, centers, max_bands, d_model=d_model, layers=layers), len(bins)
+    elif tokenize == "bandindex":
+        enc = SpecEncoderFromPatcher(BandIndexPatcher(scene.cube.shape[-1]), d_model, layers)
+        return enc, BandIndexPatcher(scene.cube.shape[-1]).T
+    elif tokenize.startswith("bandeq"):
+        n_tok = int(tokenize[6:])
+        enc = SpecEncoderFromPatcher(BandIndexPatcher(scene.cube.shape[-1], n_tokens=n_tok), d_model, layers)
+        return enc, n_tok
+    raise ValueError(tokenize)
+
+
+class SpecEncoderFromPatcher(nn.Module):
+    """Same head as SpecEncoder but around a BandIndexPatcher."""
+
+    def __init__(self, patcher, d_model: int = 128, layers: int = 2):
+        super().__init__()
+        self.patcher = patcher
+        enc = nn.TransformerEncoderLayer(d_model, 4, 256, dropout=0.1, batch_first=True)
+        self.encoder = nn.TransformerEncoder(enc, layers)
+        self.out = nn.Linear(d_model, 768)
+
+    def forward(self, x):
+        return self.out(self.encoder(self.patcher(x)))

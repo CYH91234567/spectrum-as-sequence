@@ -110,6 +110,19 @@ def main():
                                  stride=args.stride, layers=args.layers).to(device)
     adapter.text_emb = T
 
+    test_mask = None
+    if len(pixels) > 2048:
+        # 50/50 split for the full-supervision ceiling (same protocol as v2)
+        rng_s = np.random.default_rng(123)
+        perm = rng_s.permutation(len(pixels))
+        half = len(perm) // 2
+        tr, te = perm[:half], perm[half:]
+        test_mask = np.zeros(scene.gt.shape, dtype=bool)
+        test_mask[pixels[te, 0], pixels[te, 1]] = True
+        train_mask = np.zeros(scene.gt.shape, dtype=bool)
+        train_mask[pixels[tr, 0], pixels[tr, 1]] = True
+        print(f"split: train {len(tr)} px, test {len(te)} px")
+        pixels, labels = pixels[tr], labels[tr]
     spec = torch.from_numpy(gather_spectra(scene, pixels, ctx=args.ctx)).to(device)
     y = torch.from_numpy(labels).to(device)
 
@@ -144,6 +157,13 @@ def main():
 
     pred = predict_map(adapter, scene, ctx=args.ctx, device=device)
     res = metrics(pred, scene.gt, scene.num_classes)
+    if test_mask is not None:
+        from .train_v2 import metrics_masked
+        res_test = metrics_masked(pred, scene.gt, scene.num_classes, test_mask)
+        res["heldout_mIoU"] = res_test["mIoU"]
+        res["heldout_OA"] = res_test["OA"]
+        res["heldout_mRecall"] = res_test["mRecall"]
+        print(f"held-out ceiling: mIoU {res['heldout_mIoU']:.4f} OA {res['heldout_OA']:.4f}")
     res.update({
         "seed": args.seed, "shots": args.shots, "ctx": args.ctx,
         "trainable_params_M": n_params / 1e6,

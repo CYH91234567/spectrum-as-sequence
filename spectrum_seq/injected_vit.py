@@ -35,12 +35,14 @@ class InjectedCLIP(nn.Module):
     """
 
     def __init__(self, clip_model, bins, centers, max_bands,
-                 d_spec=128, spec_layers=2, inject_layers=(3, 6, 9)):
+                 d_spec=128, spec_layers=2, inject_layers=(3, 6, 9), spec_enc=None):
         super().__init__()
         self.v = clip_model.visual
         for p in self.v.parameters():
             p.requires_grad_(False)
-        self.spec_enc = SpecEncoder(bins, centers, max_bands, d_model=d_spec, layers=spec_layers)
+        # spec_enc override supports the M4 tokenize ablation (BandIndexPatcher etc.)
+        self.spec_enc = spec_enc if spec_enc is not None else SpecEncoder(
+            bins, centers, max_bands, d_model=d_spec, layers=spec_layers)
         self.inject_layers = tuple(inject_layers)
         self.inject = nn.ModuleList([SpecInjection(768) for _ in self.inject_layers])
         self.text_tower = clip_model.transformer  # unused here; text encoded separately
