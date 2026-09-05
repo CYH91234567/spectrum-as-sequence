@@ -139,16 +139,6 @@ if tok_rows:
     plt.close()
 
 # ---------- Fig 3b: TSC points into base/novel chart ----------
-tsc_rows = []
-for beta in ["0.5", "1", "2"]:
-    f_t = j(RI, f"train_metrics_v2_paviau_s5_prior_base0-1-2-3-5_seed0.json")
-    # TSC runs write with trans tag; fall back to scanning
-    for f in glob.glob(j(RI, "train_metrics_*tsc*.json")) or glob.glob(j(RI, "train_metrics_v2_paviau_s5_prior*.json")):
-        d = json.load(open(f, encoding="utf-8"))
-        if abs(d.get("trans_w", -1) - float(beta)) < 1e-6:
-            tsc_rows.append((f"5-shot TSC beta={beta}", d))
-            break
-
 # ---------- summary tables ----------
 rows = []
 for dname, d in [("pilot_v1", R1), ("pilot_v2", R2)]:

@@ -209,6 +209,8 @@ def main():
 
     # ckpt config first: band-index tokenizers must reuse the TRAIN scene's
     # chunk definition at zero-shot time (that misalignment IS the ablation)
+    test_mask = None
+    train_mask = None
     eval_cfg = None
     if args.eval_only_ckpt:
         eval_cfg = torch.load(args.eval_only_ckpt, map_location="cpu", weights_only=False).get("config", {})
@@ -388,24 +390,26 @@ def main():
                 # TSC: spectral-neighbourhood consistency + marginal balancing.
                 # Neighbour graph lives on the spectral manifold (not RGB/space).
                 t_rgb, t_spec, knn_idx = trans_data
-                t_logits = []
+                # per-chunk forward+backward: retaining all chunk graphs OOMs
+                n_chunks = (t_spec.shape[0] + 127) // 128
+                tsc_val = 0.0
                 for cj in range(0, t_spec.shape[0], 128):
                     with torch.autocast(device_type="cuda"):
                         zt = model.encode_image(t_rgb[cj:cj + 128].float(), t_spec[cj:cj + 128].float())
-                    t_logits.append(F.normalize(zt.float(), dim=-1) @ T.T)
-                t_logits = torch.cat(t_logits, 0)                      # (N, C)
-                p_all = F.softmax(t_logits, -1)
-                # KL(mean(p) || uniform) = log C + sum m_c log m_c  (>= 0)
-                m = p_all.mean(0)
-                l_marg = (m * m.clamp_min(1e-8).log()).sum() +                     torch.log(torch.tensor(float(p_all.shape[1]), device=t_logits.device))
-                # JS(p_i, p_j) over spectral kNN pairs
-                pj = p_all[knn_idx]                                    # (N, k, C)
-                log_m = ((p_all.unsqueeze(1) + pj) / 2).clamp_min(1e-8).log()
-                l_cons = 0.5 * F.kl_div(log_m, p_all.unsqueeze(1).expand_as(pj),
-                                        reduction="batchmean") +                     0.5 * F.kl_div(log_m, pj, reduction="batchmean")
-                l_tsc = l_marg + l_cons
-                (args.trans_w * l_tsc).backward()
-                loss = loss.detach() + float(l_tsc) * args.trans_w
+                    t_logits = F.normalize(zt.float(), dim=-1) @ T.T
+                    p_all = F.softmax(t_logits, -1)
+                    # KL(mean(p) || uniform) = log C + sum m_c log m_c  (>= 0)
+                    m = p_all.mean(0)
+                    l_marg = (m * m.clamp_min(1e-8).log()).sum() +                         torch.log(torch.tensor(float(p_all.shape[1]), device=t_logits.device))
+                    # JS(p_i, p_j) over spectral kNN pairs
+                    pj = p_all[knn_idx[cj:cj + 128]]                   # (n, k, C)
+                    log_m = ((p_all.unsqueeze(1) + pj) / 2).clamp_min(1e-8).log()
+                    l_cons = 0.5 * F.kl_div(log_m, p_all.unsqueeze(1).expand_as(pj),
+                                            reduction="batchmean") +                         0.5 * F.kl_div(log_m, pj, reduction="batchmean")
+                    l_tsc = (l_marg + l_cons) / n_chunks
+                    (args.trans_w * l_tsc).backward()
+                    tsc_val += float(l_tsc)
+                loss = loss.detach() + args.trans_w * tsc_val
             opt.step()
             sched.step()
             if args.prior_kl > 0:

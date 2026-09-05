@@ -53,6 +53,32 @@ This repo contains the **pilot v1** experiment of the research route:
   Indian Pines zero-shot fails): patches must be defined in wavelength space,
   which is exactly the tokenize-mechanism question this project studies.
 
+
+## Overnight additions (full-supervision ceilings + mechanism studies)
+
+| Full supervision, 50/50 held-out | PaviaU | Indian Pines |
+|---|---|---|
+| v2 injected adapter | **99.93% mIoU** | **98.04% mIoU** |
+| v1 pooled adapter | 64.99% | — |
+
+Mechanism studies (5-shot PaviaU -> zero-shot Indian Pines):
+
+- **Tokenize ablation**: physical wavelength alignment at 50 nm bins gives 1.75x
+  the RGB-direct zero-shot recall; band-index tokenization 1.27x, equal-count
+  band chunks 0.98x, too-fine (25 nm) 0.57x. In-domain mIoU is insensitive to
+  tokenization (40-58%) — the transfer mechanism is the alignment.
+- **Kernel control**: the sequence-modeling kernel costs ~3 pp in-domain at
+  5-shot (mlp 54.2 > cnn 52.8 > ts 50.8) but is the decisive transfer component
+  (ts 1.75x > mlp 1.21x > cnn 1.06x). Wavelength alignment and the sequence
+  kernel combine multiplicatively (2x2 factorial: 1.21x / 1.27x / 1.75x).
+- **TSC (spectral-neighbourhood transductive consistency)**: breaks the 5-shot
+  base/novel trade-off — novel 5.4-5.5 mIoU (1.6x the RGB baseline) with base
+  held at 39-43; hMIoU 4.6 -> 9.6. See BENCHMARK.md for the protocol.
+
+New figures: fig3 (base/novel with TSC), fig5 (tokenize mechanism),
+fig6 (transfer-mechanism factorial). Results under results/fullsup and
+results/innovation.
+
 ## Layout
 
 ```
