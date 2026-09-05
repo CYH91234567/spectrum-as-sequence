@@ -106,6 +106,49 @@ plt.tight_layout()
 plt.savefig(j(FIG, "fig4_prediction_maps.png"), bbox_inches="tight")
 plt.close()
 
+
+# ---------- Fig 5: M4 tokenize mechanism ablation ----------
+RI = os.path.join(HERE, "..", "results", "innovation")
+tok_rows = []
+for tok in ["wl100", "wl50", "wl25", "bandeq9", "bandindex"]:
+    f_in = j(RI, f"train_metrics_v2_paviau_s5_inj{'_' + tok if tok != 'wl50' else ''}_seed0.json")
+    f_zs = j(RI, f"train_metrics_zs_v2_paviau_s5_inj{'_' + tok if tok != 'wl50' else ''}_seed0_to_indianpines.json")
+    if not os.path.exists(f_in):
+        continue
+    d_in = json.load(open(f_in, encoding="utf-8"))
+    d_zs = json.load(open(f_zs, encoding="utf-8")) if os.path.exists(f_zs) else {}
+    rgb_ip = json.load(open(j(R1, "rgb_baseline_indianpines.json"), encoding="utf-8"))
+    tok_rows.append((tok, 100 * d_in["mIoU"],
+                     100 * d_zs.get("mRecall", 0) / max(100 * rgb_ip["mRecall"], 1e-9)))
+if tok_rows:
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 3.6))
+    names = [r[0] for r in tok_rows]
+    axes[0].bar(names, [r[1] for r in tok_rows], color="#5b8db8")
+    axes[0].set_ylabel("PaviaU 5-shot mIoU (%)")
+    axes[0].set_title("In-domain")
+    axes[1].bar(names, [r[2] for r in tok_rows], color="#c44e52")
+    axes[1].axhline(1.0, ls=":", color="#777")
+    axes[1].set_ylabel("IP zero-shot mRecall / RGB baseline")
+    axes[1].set_title("Cross-sensor transfer (ratio to RGB-direct)")
+    for ax in axes:
+        ax.tick_params(axis="x", labelsize=8.5)
+        ax.spines[["top", "right"]].set_visible(False)
+    fig.suptitle("M4: spectral-axis tokenization mechanism", y=1.02)
+    plt.tight_layout()
+    plt.savefig(j(FIG, "fig5_tokenize_ablation.png"), bbox_inches="tight")
+    plt.close()
+
+# ---------- Fig 3b: TSC points into base/novel chart ----------
+tsc_rows = []
+for beta in ["0.5", "1", "2"]:
+    f_t = j(RI, f"train_metrics_v2_paviau_s5_prior_base0-1-2-3-5_seed0.json")
+    # TSC runs write with trans tag; fall back to scanning
+    for f in glob.glob(j(RI, "train_metrics_*tsc*.json")) or glob.glob(j(RI, "train_metrics_v2_paviau_s5_prior*.json")):
+        d = json.load(open(f, encoding="utf-8"))
+        if abs(d.get("trans_w", -1) - float(beta)) < 1e-6:
+            tsc_rows.append((f"5-shot TSC beta={beta}", d))
+            break
+
 # ---------- summary tables ----------
 rows = []
 for dname, d in [("pilot_v1", R1), ("pilot_v2", R2)]:

@@ -37,4 +37,9 @@ PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True $PY -u -m spectrum_seq.train_v2
   --fuse prior --base_ids 0,1,2,3,5 --balanced --trans_w 1 \
   > $OUT/innovation/tsc50_beta1.log 2>&1
 
+# kernel-control ablation (fixed wl50 binning, vary the sequence kernel)
+for ENC in cnn mlp; do
+  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True $PY -u -m spectrum_seq.train_v2     --data $DATA --clip $CLIP --out $OUT --shots 5 --epochs 300     --fuse injection --enc $ENC > $OUT/innovation/enc_${ENC}.log 2>&1
+done
+
 echo DONE > /tmp/innov.flag

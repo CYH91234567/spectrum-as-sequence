@@ -178,6 +178,8 @@ def main():
                          "(prior-preserving self-distillation)")
     ap.add_argument("--n_unlab", type=int, default=1024,
                     help="unlabeled pixels sampled for the KL term")
+    ap.add_argument("--enc", default="ts", choices=["ts", "cnn", "mlp"],
+                    help="kernel-control ablation: sequence-modeling kernel over bin tokens")
     ap.add_argument("--tokenize", default="wl50",
                     help="M4 ablation: wl25/wl50/wl100 wavelength bins, "
                          "bandindex (P25 S5), bandeq9 (9 equal chunks)")
@@ -214,6 +216,11 @@ def main():
     if args.tokenize != "wl50" and eval_cfg is not None:
         token_src = eval_cfg.get("train_scene") or eval_cfg.get("eval_scene") or args.eval_scene
     spec_enc = None
+    if args.enc != "ts":
+        from .wavelength_patcher import SpecEncoderVariant
+        spec_enc = SpecEncoderVariant(bins, centers, MAX_BANDS,
+                                      d_model=args.d_spec, variant=args.enc)
+        print(f"enc variant: {args.enc}")
     if args.tokenize != "wl50":
         from .wavelength_patcher import build_spec_encoder
         spec_enc, n_tok = build_spec_encoder(args.tokenize, load_scene(token_src, args.data),
@@ -240,7 +247,9 @@ def main():
         fuse_tag = "prior" if args.fuse == "prior" else "inj"
         base_tag = "_base" + args.base_ids.replace(",", "-") if args.base_ids else ""
         tok_tag = "" if args.tokenize == "wl50" else f"_{args.tokenize}"
-        tag = f"v2_{train_scene_name}_s{args.shots}_{fuse_tag}{tok_tag}{base_tag}_seed{args.seed}"
+        tsc_tag = f"_tsc{args.trans_w}" if args.trans_w > 0 else ""
+        enc_tag = "" if args.enc == "ts" else f"_{args.enc}"
+        tag = f"v2_{train_scene_name}_s{args.shots}_{fuse_tag}{tok_tag}{enc_tag}{base_tag}{tsc_tag}_seed{args.seed}"
         ckpt_path = os.path.join(args.out, f"adapter_{tag}.pt")
         base_ids = [int(i) for i in args.base_ids.split(",")] if args.base_ids else None
         rgb = make_rgb_cube(train_scene)
@@ -430,7 +439,9 @@ def main():
         res["s_residual"] = float(s_res.exp()) if s_res is not None else None
     res.update({"tag": tag, "eval_time_s": eval_time,
                 "eval_peak_GB": torch.cuda.max_memory_allocated() / 2**30,
-                "bins": len(bins), "bin_um": BIN_UM})
+                "bins": len(bins), "bin_um": BIN_UM,
+                "tokenize": args.tokenize, "trans_w": args.trans_w,
+                "knn": args.knn, "fuse": args.fuse, "enc": args.enc})
     print(json.dumps({k: v for k, v in res.items() if not isinstance(v, list)}, indent=2))
     with open(os.path.join(args.out, f"train_metrics_{tag}.json"), "w") as f:
         json.dump(res, f, indent=2)

@@ -165,3 +165,35 @@ class SpecEncoderFromPatcher(nn.Module):
 
     def forward(self, x):
         return self.out(self.encoder(self.patcher(x)))
+
+
+class SpecEncoderVariant(nn.Module):
+    """Kernel-control ablation (T3.3): same wavelength binning, same interface,
+    three sequence-modeling kernels:
+      ts  : shared embed + TransformerEncoder over bin tokens (default)
+      cnn : shared embed + temporal Conv1d over bin tokens
+      mlp : shared embed only (no cross-token interaction)
+    """
+
+    def __init__(self, bins, centers, max_bands, d_model=128, variant="ts"):
+        super().__init__()
+        self.patcher = WavelengthPatcher(bins, centers, max_bands, d_model)
+        self.variant = variant
+        if variant == "ts":
+            enc = nn.TransformerEncoderLayer(d_model, 4, 256, dropout=0.1, batch_first=True)
+            self.body = nn.TransformerEncoder(enc, 2)
+        elif variant == "cnn":
+            self.body = nn.Sequential(
+                nn.Conv1d(d_model, d_model, kernel_size=3, padding=1), nn.GELU(),
+                nn.Conv1d(d_model, d_model, kernel_size=3, padding=1))
+        elif variant == "mlp":
+            self.body = nn.Identity()
+        self.out = nn.Linear(d_model, 768)
+
+    def forward(self, x):
+        tok = self.patcher(x)
+        if self.variant == "cnn":
+            tok = self.body(tok.transpose(1, 2)).transpose(1, 2)
+        else:
+            tok = self.body(tok)
+        return self.out(tok)
