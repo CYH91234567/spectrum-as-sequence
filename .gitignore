@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+server_exec.py
+data/
+*.pt
+*.npy
+.venv/
