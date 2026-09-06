@@ -49,9 +49,14 @@ numbers are meaningless for high-capacity adapters.
 ## Baselines
 
 1. RGB-direct CLIP zero-shot (spectral → RGB interpolation, 32×32 crops).
-2. Pooled spectral adapter (pilot v1 architecture).
-3. Injected adapter (this work).
-4. Reference numbers quoted from SPECIAL / HSI-Adapter / SegEarth-OV
+   Two variants exist and must be labelled: **no-transduction** (PaviaU 3.38%
+   mIoU) and **with class-balanced transduction** (PaviaU 5.50%).
+2. **Trivial spectral 1-NN** (zero-training; `spectrum_seq/spectral_1nn.py`):
+   same normalisation and seed-0 5-shot exemplars, leave-one-out nearest
+   neighbour on unit-RMS spectra. PaviaU 39.07 / IP 31.60 mIoU.
+3. Pooled spectral adapter (pilot v1 architecture).
+4. Injected adapter (this work).
+5. Reference numbers quoted from SPECIAL / HSI-Adapter / SegEarth-OV
    (their protocols differ; quoted only for context, never mixed into tables).
 
 ## Footguns (documented so they are never repeated)

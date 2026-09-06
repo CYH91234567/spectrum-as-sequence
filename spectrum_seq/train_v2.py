@@ -178,6 +178,9 @@ def main():
                          "(prior-preserving self-distillation)")
     ap.add_argument("--n_unlab", type=int, default=1024,
                     help="unlabeled pixels sampled for the KL term")
+    ap.add_argument("--spatial_block", type=int, default=0,
+                    help="if >0, full-sup ceiling uses a checkerboard of "
+                         "spatial_block x spatial_block blocks as test half")
     ap.add_argument("--enc", default="ts", choices=["ts", "cnn", "mlp"],
                     help="kernel-control ablation: sequence-modeling kernel over bin tokens")
     ap.add_argument("--tokenize", default="wl50",
@@ -186,6 +189,11 @@ def main():
     ap.add_argument("--trans_w", type=float, default=0.0,
                     help="TSC: weight of spectral-neighbourhood consistency + "
                          "marginal balancing on unlabeled pixels")
+    ap.add_argument("--tsc_parts", default="both", choices=["both", "cons", "marg"],
+                    help="component ablation: which TSC terms to apply")
+    ap.add_argument("--tsc_random_graph", action="store_true",
+                    help="replace the spectral kNN graph by a random graph "
+                         "(control for the spectral-manifold claim)")
     ap.add_argument("--n_trans", type=int, default=512)
     ap.add_argument("--knn", type=int, default=8)
     ap.add_argument("--fuse", choices=["injection", "prior"], default="injection",
@@ -250,8 +258,13 @@ def main():
         base_tag = "_base" + args.base_ids.replace(",", "-") if args.base_ids else ""
         tok_tag = "" if args.tokenize == "wl50" else f"_{args.tokenize}"
         tsc_tag = f"_tsc{args.trans_w}" if args.trans_w > 0 else ""
+        if args.trans_w > 0 and args.tsc_parts != "both":
+            tsc_tag += f"_{args.tsc_parts}"
+        if args.tsc_random_graph:
+            tsc_tag += "_randg"
         enc_tag = "" if args.enc == "ts" else f"_{args.enc}"
-        tag = f"v2_{train_scene_name}_s{args.shots}_{fuse_tag}{tok_tag}{enc_tag}{base_tag}{tsc_tag}_seed{args.seed}"
+        sp_tag = f"_sp{args.spatial_block}" if args.spatial_block > 0 else ""
+        tag = f"v2_{train_scene_name}_s{args.shots}_{fuse_tag}{tok_tag}{enc_tag}{base_tag}{tsc_tag}{sp_tag}_seed{args.seed}"
         ckpt_path = os.path.join(args.out, f"adapter_{tag}.pt")
         base_ids = [int(i) for i in args.base_ids.split(",")] if args.base_ids else None
         rgb = make_rgb_cube(train_scene)
@@ -274,17 +287,31 @@ def main():
         if big_mode:
             # 50/50 train/test split: a 7.46M adapter memorises the train set,
             # so the ceiling must be measured on held-out pixels
-            rng_s = np.random.default_rng(123)
-            perm = rng_s.permutation(len(pixels))
-            half = len(perm) // 2
-            tr, te = perm[:half], perm[half:]
-            pixels_tr, labels_tr = pixels[tr], labels[tr]
-            test_mask = np.zeros(train_scene.gt.shape, dtype=bool)
-            test_mask[pixels[te, 0], pixels[te, 1]] = True
-            train_mask = np.zeros(train_scene.gt.shape, dtype=bool)
-            train_mask[pixels_tr[:, 0], pixels_tr[:, 1]] = True
-            print(f"split: train {len(tr)} px, test {len(te)} px", flush=True)
-            pixels, labels = pixels_tr, labels_tr
+            if args.spatial_block > 0:
+                # checkerboard of spatial blocks kills pixel-level leakage
+                blk = args.spatial_block
+                Hs, Ws, _ = train_scene.shape
+                yy, xx = np.mgrid[0:Hs, 0:Ws]
+                test_mask = ((yy // blk) + (xx // blk)) % 2 == 0
+                labelled = train_scene.gt > 0
+                test_mask = test_mask & labelled
+                train_mask = labelled & ~test_mask
+                pixels = np.column_stack(np.where(train_mask))
+                labels = train_scene.gt[pixels[:, 0], pixels[:, 1]] - 1
+                print(f"spatial {blk}x{blk} checkerboard split: train {len(pixels)} px, "
+                      f"test {int(test_mask.sum())} px", flush=True)
+            else:
+                rng_s = np.random.default_rng(123)
+                perm = rng_s.permutation(len(pixels))
+                half = len(perm) // 2
+                tr, te = perm[:half], perm[half:]
+                pixels_tr, labels_tr = pixels[tr], labels[tr]
+                test_mask = np.zeros(train_scene.gt.shape, dtype=bool)
+                test_mask[pixels[te, 0], pixels[te, 1]] = True
+                train_mask = np.zeros(train_scene.gt.shape, dtype=bool)
+                train_mask[pixels_tr[:, 0], pixels_tr[:, 1]] = True
+                print(f"split: train {len(tr)} px, test {len(te)} px", flush=True)
+                pixels, labels = pixels_tr, labels_tr
         spec_b = torch.from_numpy(train_scene.cube[pixels[:, 0], pixels[:, 1]]).to(device)
         y = torch.from_numpy(labels).to(device)
         rgb_b = None if big_mode else rgb_crop_tensor(rgb, pixels[:, 0], pixels[:, 1], device)
@@ -317,6 +344,9 @@ def main():
             sim = tspec @ tspec.T
             np.fill_diagonal(sim, -9.0)
             knn_idx = np.argsort(-sim, axis=1)[:, :args.knn]        # (N, k)
+            if args.tsc_random_graph:
+                rng_g = np.random.default_rng(args.seed + 3)
+                knn_idx = rng_g.integers(0, len(tspec), size=(len(tspec), args.knn))
             t_rgb = rgb_crop_tensor(rgb, tpix[:, 0], tpix[:, 1], device).half()
             t_spec = torch.from_numpy(tspec).to(device).half()
             trans_data = (t_rgb, t_spec, torch.from_numpy(knn_idx).to(device))
@@ -360,21 +390,26 @@ def main():
                 if (ep + 1) % 10 == 0 or ep == 0:
                     print(f"ep {ep+1}: loss {ep_loss/nb:.4f}", flush=True)
                 continue
-            noise = 0.02 * torch.randn_like(spec_b)
-            with torch.autocast(device_type="cuda"):
-                if args.fuse == "prior":
-                    z0, z1 = model.encode_image_with_prior(rgb_b, spec_b + noise)
-                    n0 = F.normalize(z0.float(), dim=-1)
-                    n1 = F.normalize(z1.float(), dim=-1)
-                    logits = 100.0 * n0 @ T.T + s_res.exp() * 100.0 * n1 @ T.T
-                else:
-                    z = model.encode_image(rgb_b, spec_b + noise)
-                    logits = 100.0 * F.normalize(z.float(), dim=-1) @ T.T
-                loss = F.cross_entropy(logits, y)
             opt.zero_grad()
-            loss.backward()
+            # chunked forward/backward: >~500 crops with grad can OOM on 24GB
+            ep_loss_val, n_chunks = 0.0, (spec_b.shape[0] + 255) // 256
+            for cj in range(0, spec_b.shape[0], 256):
+                noise = 0.02 * torch.randn_like(spec_b[cj:cj + 256])
+                with torch.autocast(device_type="cuda"):
+                    if args.fuse == "prior":
+                        z0, z1 = model.encode_image_with_prior(rgb_b[cj:cj + 256], spec_b[cj:cj + 256] + noise)
+                        n0 = F.normalize(z0.float(), dim=-1)
+                        n1 = F.normalize(z1.float(), dim=-1)
+                        logits = 100.0 * n0 @ T.T + s_res.exp() * 100.0 * n1 @ T.T
+                    else:
+                        z = model.encode_image(rgb_b[cj:cj + 256], spec_b[cj:cj + 256] + noise)
+                        logits = 100.0 * F.normalize(z.float(), dim=-1) @ T.T
+                    loss_c = F.cross_entropy(logits, y[cj:cj + 256])
+                (loss_c / n_chunks).backward()
+                ep_loss_val += float(loss_c)
+            loss_val = ep_loss_val / n_chunks
             kl_val = 0.0
-            if args.prior_kl > 0:
+            if args.prior_kl > 0 and spec_b.shape[0] <= 256:
                 # per-chunk backward: accumulating graphs across chunks OOMs
                 n_chunks = (spec_u.shape[0] + 127) // 128
                 for j in range(0, spec_u.shape[0], 128):
@@ -386,7 +421,7 @@ def main():
                                     reduction="batchmean")
                     (args.prior_kl * kl_c / n_chunks).backward()
                     kl_val += float(kl_c)
-            if trans_data is not None:
+            if trans_data is not None and spec_b.shape[0] <= 256:
                 # TSC: spectral-neighbourhood consistency + marginal balancing.
                 # Neighbour graph lives on the spectral manifold (not RGB/space).
                 t_rgb, t_spec, knn_idx = trans_data
@@ -406,16 +441,19 @@ def main():
                     log_m = ((p_all.unsqueeze(1) + pj) / 2).clamp_min(1e-8).log()
                     l_cons = 0.5 * F.kl_div(log_m, p_all.unsqueeze(1).expand_as(pj),
                                             reduction="batchmean") +                         0.5 * F.kl_div(log_m, pj, reduction="batchmean")
-                    l_tsc = (l_marg + l_cons) / n_chunks
+                    if args.tsc_parts == "both":
+                        l_tsc = (l_marg + l_cons) / n_chunks
+                    elif args.tsc_parts == "cons":
+                        l_tsc = l_cons / n_chunks
+                    else:
+                        l_tsc = l_marg / n_chunks
                     (args.trans_w * l_tsc).backward()
                     tsc_val += float(l_tsc)
                 loss = loss.detach() + args.trans_w * tsc_val
             opt.step()
             sched.step()
-            if args.prior_kl > 0:
-                loss = loss.detach() + args.prior_kl * kl_val / max(n_chunks, 1)
             if (ep + 1) % 100 == 0 or ep == 0:
-                print(f"ep {ep+1}: loss {loss.item():.4f}")
+                print(f"ep {ep+1}: loss {loss_val:.4f}")
         train_time = time.time() - t0
         peak = torch.cuda.max_memory_allocated() / 2**30
         torch.save({"state": model.state_dict(), "config": vars(args)}, ckpt_path)
@@ -441,11 +479,14 @@ def main():
     if args.base_ids:
         res = split_metrics(res, [int(i) for i in args.base_ids.split(",")], scene.num_classes)
         res["s_residual"] = float(s_res.exp()) if s_res is not None else None
+    n_tokens_actual = int(model.spec_enc.patcher.pe.shape[0]) if hasattr(model.spec_enc, "patcher")         else len(bins)
     res.update({"tag": tag, "eval_time_s": eval_time,
                 "eval_peak_GB": torch.cuda.max_memory_allocated() / 2**30,
-                "bins": len(bins), "bin_um": BIN_UM,
+                "bins": n_tokens_actual, "bin_um": BIN_UM,
                 "tokenize": args.tokenize, "trans_w": args.trans_w,
-                "knn": args.knn, "fuse": args.fuse, "enc": args.enc})
+                "knn": args.knn, "fuse": args.fuse, "enc": args.enc,
+                "tsc_parts": args.tsc_parts, "tsc_random_graph": args.tsc_random_graph,
+                "spatial_block": args.spatial_block})
     print(json.dumps({k: v for k, v in res.items() if not isinstance(v, list)}, indent=2))
     with open(os.path.join(args.out, f"train_metrics_{tag}.json"), "w") as f:
         json.dump(res, f, indent=2)
